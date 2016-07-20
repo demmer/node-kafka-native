@@ -1,3 +1,4 @@
+//@file INTRODUCTION.md
 # Introduction to librdkafka - the Apache Kafka C/C++ client library
 
 
@@ -35,8 +36,6 @@ librdkafka is a multi-threaded library designed for use on modern hardware and
 it attempts to keep memory copying at a minimal. The payload of produced or
 consumed messages may pass through without any copying
 (if so desired by the application) putting no limit on message sizes.
-
-> *"You can have high throughput or low latency, but you cant have both"*
 
 librdkafka allows you to decide if high throughput is the name of the game,
 or if a low latency service is required, all through the configuration
@@ -112,8 +111,10 @@ per topic+partition basis.
 
 When low latency messaging is required the "queue.buffering.max.ms" should be
 tuned to the maximum permitted producer-side latency.
-Setting queue.buffering.max.ms to 0 will make sure messages are sent as
-soon as possible.
+Setting queue.buffering.max.ms to 1 will make sure messages are sent as
+soon as possible. You could check out [How to decrease message latency]
+(https://github.com/edenhill/librdkafka/wiki/How-to-decrease-message-latency)
+to find more details.
 
 
 ### Compression
@@ -172,7 +173,7 @@ The delivery report callback is optional.
 ### Documentation
 
 The librdkafka API is documented in the
-[`rdkafka.h`](https://github.com/edenhill/librdkafka/blob/master/rdkafka.h)
+[`rdkafka.h`](https://github.com/edenhill/librdkafka/blob/master/src/rdkafka.h)
 header file, the configuration properties are documented in 
 [`CONFIGURATION.md`](https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md)
 
@@ -280,6 +281,21 @@ addresses for each connection attempt.
 A DNS record containing all broker address can thus be used to provide a
 reliable bootstrap broker.
 
+### Feature discovery
+
+Apache Kafka broker version 0.10.0 added support for the ApiVersionRequest API
+which allows a client to query a broker for its range of supported API versions.
+
+librdkafka supports this functionality and will query each broker on connect
+for this information (if `api.version.request=true`) and use it to enable or disable
+various protocol features, such as MessageVersion 1 (timestamps), KafkaConsumer, etc.
+
+If the broker fails to respond to the ApiVersionRequest librdkafka will
+assume the broker is too old to support the API and fall back to an older
+broker version's API. These fallback versions are hardcoded in librdkafka
+and is controlled by the `broker.version.fallback` configuration property.
+
+
 
 ### Producer API
 
@@ -332,7 +348,9 @@ to `ENOBUFS`, thus providing a backpressure mechanism.
 **Note**: See `examples/rdkafka_performance.c` for a producer implementation.
 
 
-### Consumer API
+### Simple Consumer API (legacy)
+
+NOTE: For the high-level KafkaConsumer interface see rd_kafka_subscribe (rdkafka.h) or KafkaConsumer (rdkafkacpp.h)
 
 The consumer API is a bit more stateful than the producer API.
 After creating `rd_kafka_t` with type `RD_KAFKA_CONSUMER` and
@@ -402,7 +420,11 @@ purge any messages currently in the local queue.
 
 #### Offset management
 
-Offset management is available through a local offset file store, where the
+Broker based offset management is available for broker version >= 0.9.0
+in conjunction with using the high-level KafkaConsumer interface (see
+rdkafka.h or rdkafkacpp.h)
+
+Offset management is also available through a local offset file store, where the
 offset is periodically written to a local file for each topic+partition
 according to the following topic configuration properties:
 
@@ -417,10 +439,8 @@ There is currently no support for offset management with ZooKeeper.
 
 #### Consumer groups
 
-There is currently no support for consumer groups, the librdkafka consumer API
-resembles the official scala Simple Consumer.
-The application should provide its own consumer group management until
-librdkafka adds support for it.
+Broker based consumer groups (requires Apache Kafka broker >=0.9) are supported,
+see KafkaConsumer in rdkafka.h or rdkafkacpp.h
 
 
 ### Topics

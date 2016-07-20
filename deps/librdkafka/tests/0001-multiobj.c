@@ -31,30 +31,17 @@
  * Issue #20
  */
 
-#define _GNU_SOURCE
-#include <sys/time.h>
-#include <sys/resource.h>
-
 #include "test.h"
 
 /* Typical include path would be <librdkafka/rdkafka.h>, but this program
  * is built from within the librdkafka source tree and thus differs. */
 #include "rdkafka.h"  /* for Kafka driver */
 
-int main (int argc, char **argv) {
+int main_0001_multiobj (int argc, char **argv) {
 	int partition = RD_KAFKA_PARTITION_UA; /* random */
 	int i;
-	const int NUM_ITER = 100;
-	struct rlimit rlim = {};
+	const int NUM_ITER = 10;
         const char *topic = NULL;
-
-	/*
-	 * Put some limits to catch bad cleanups by librdkafka (issue #20)
-	 */
-	
-	/* File descriptors. One or two per broker. */
-	rlim.rlim_cur = rlim.rlim_max = NUM_ITER * 5;
-	setrlimit(RLIMIT_NOFILE, &rlim); /* best effort, fails under valgrind */
 
 	TEST_SAY("Creating and destroying %i kafka instances\n", NUM_ITER);
 
@@ -66,11 +53,12 @@ int main (int argc, char **argv) {
 		rd_kafka_topic_conf_t *topic_conf;
 		char errstr[512];
 		char msg[128];
+                test_timing_t t_destroy;
 
 		test_conf_init(&conf, &topic_conf, 30);
 
                 if (!topic)
-                        topic = test_mk_topic_name("generic", 0);
+                        topic = test_mk_topic_name("0001", 0);
 
 		rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
 				  errstr, sizeof(errstr));
@@ -82,9 +70,9 @@ int main (int argc, char **argv) {
 		if (!rkt)
 			TEST_FAIL("Failed to create topic for "
 				  "rdkafka instance #%i: %s\n",
-				  i, strerror(errno));
+				  i, rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
-		snprintf(msg, sizeof(msg), "%s test message for iteration #%i",
+		rd_snprintf(msg, sizeof(msg), "%s test message for iteration #%i",
 			 argv[0], i);
 
 		/* Produce a message */
@@ -97,16 +85,12 @@ int main (int argc, char **argv) {
 
 		/* Destroy topic */
 		rd_kafka_topic_destroy(rkt);
-		
+
 		/* Destroy rdkafka instance */
+                TIMING_START(&t_destroy, "rd_kafka_destroy()");
 		rd_kafka_destroy(rk);
+                TIMING_STOP(&t_destroy);
 	}
 
-	/* Wait for everything to be cleaned up since broker destroys are
-	 * handled in its own thread. */
-	test_wait_exit(10);
-
-	/* If we havent failed at this point then
-	 * there were no threads leaked */
 	return 0;
 }

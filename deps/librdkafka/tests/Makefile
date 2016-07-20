@@ -1,27 +1,58 @@
-TESTSRCS ?= $(wildcard 0*-*.c) $(wildcard 0*-*.cpp)
-TESTS    ?= $(TESTSRCS:%.cpp=%.test)
-TESTS0    = $(TESTS:%.c=%.test)
+TESTSRCS_C = $(wildcard 0*-*.c)
+TESTSRCS_CXX= $(wildcard 0*-*.cpp)
+OBJS	  = $(TESTSRCS_C:%.c=%.o) $(TESTSRCS_CXX:%.cpp=%.o)
 
-%.test: ../src/librdkafka.a test.o %.c
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lrdkafka $(LIBS)
+BIN	  = merged
+LIBS	 += -lrdkafka
+OBJS	 += test.o tinycthread.o
+CFLAGS += -I../src
+CXXFLAGS += -I../src -I../src-cpp
+LDFLAGS += -L../src -L../src-cpp
 
-%.test: ../src/librdkafka.a test.o %.cpp
-	$(CXX) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lrdkafka++ -lrdkafka $(LIBS)
 
-all: $(TESTS0)
-	for i in $^ ; do \
-	 LD_LIBRARY_PATH=../src:../src-cpp ./run-test.sh $$i || exit 1 ; \
-	done
+-include ../Makefile.config
+
+all: $(BIN) run_par
+
+trunk: build
+	./broker_version_tests.py trunk
+	./sasl_test.py trunk
+
+# Run the full test suite(s)
+full: build
+	./broker_version_tests.py
+	./sasl_test.py
+
+run_par: $(BIN)
+	@echo "Running tests in parallel"
+	./run-test.sh -p5 ./$(BIN)
+
+run_seq: $(BIN)
+	@echo "Running tests sequentially"
+	./run-test.sh -p1 ./$(BIN)
+
+run_local: $(BIN)
+	@echo "Running local broker-less tests"
+	./run-test.sh -p5 -l ./$(BIN)
+
+build: $(BIN)
+
+test.o: ../src/librdkafka.a
+
 
 include ../mklove/Makefile.base
 
-CFLAGS += -I../src -I../src-cpp
-LDFLAGS += -L../src -L../src-cpp
-
-test.o: test.c
-	$(CC) $(CFLAGS) -c $<
+tinycthread.o: ../src/tinycthread.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $<
 
 
 clean:
-	rm -f *.test test.o
+	rm -f *.test $(OBJS) $(BIN)
 
+
+clean-output:
+	# Clean test output files
+	rm -f stats_*.json *.offset
+
+realclean: clean clean-output
+	rm -f test_report_*.json
