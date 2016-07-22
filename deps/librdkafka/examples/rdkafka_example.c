@@ -38,8 +38,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <syslog.h>
+#include <time.h>
 #include <sys/time.h>
-#include <errno.h>
 
 /* Typical include path would be <librdkafka/rdkafka.h>, but this program
  * is builtin from within the librdkafka source tree and thus differs. */
@@ -63,7 +63,7 @@ static void stop (int sig) {
 
 static void hexdump (FILE *fp, const char *name, const void *ptr, size_t len) {
 	const char *p = (const char *)ptr;
-	int of = 0;
+	size_t of = 0;
 
 
 	if (name)
@@ -77,12 +77,12 @@ static void hexdump (FILE *fp, const char *name, const void *ptr, size_t len) {
 		int cof = 0;
 		int i;
 
-		for (i = of ; i < of + 16 && i < len ; i++) {
+		for (i = of ; i < (int)of + 16 && i < (int)len ; i++) {
 			hof += sprintf(hexen+hof, "%02x ", p[i] & 0xff);
 			cof += sprintf(charen+cof, "%c",
 				       isprint((int)p[i]) ? p[i] : '.');
 		}
-		fprintf(fp, "%08x: %-48s %-16s\n",
+		fprintf(fp, "%08zx: %-48s %-16s\n",
 			of, hexen, charen);
 	}
 }
@@ -96,7 +96,7 @@ static void logger (const rd_kafka_t *rk, int level,
 	gettimeofday(&tv, NULL);
 	fprintf(stderr, "%u.%03u RDKAFKA-%i-%s: %s: %s\n",
 		(int)tv.tv_sec, (int)(tv.tv_usec / 1000),
-		level, fac, rd_kafka_name(rk), buf);
+		level, fac, rk ? rd_kafka_name(rk) : NULL, buf);
 }
 
 /**
@@ -113,7 +113,8 @@ static void msg_delivered (rd_kafka_t *rk,
 		fprintf(stderr, "%% Message delivery failed: %s\n",
 			rd_kafka_err2str(error_code));
 	else if (!quiet)
-		fprintf(stderr, "%% Message delivered (%zd bytes)\n", len);
+		fprintf(stderr, "%% Message delivered (%zd bytes): %.*s\n", len,
+			(int)len, (const char *)payload);
 }
 
 /**
@@ -121,13 +122,18 @@ static void msg_delivered (rd_kafka_t *rk,
  */
 static void msg_delivered2 (rd_kafka_t *rk,
                             const rd_kafka_message_t *rkmessage, void *opaque) {
+	printf("del: %s: offset %"PRId64"\n",
+	       rd_kafka_err2str(rkmessage->err), rkmessage->offset);
         if (rkmessage->err)
 		fprintf(stderr, "%% Message delivery failed: %s\n",
                         rd_kafka_message_errstr(rkmessage));
 	else if (!quiet)
 		fprintf(stderr,
-                        "%% Message delivered (%zd bytes, offset %"PRId64")\n",
-                        rkmessage->len, rkmessage->offset);
+                        "%% Message delivered (%zd bytes, offset %"PRId64", "
+                        "partition %"PRId32"): %.*s\n",
+                        rkmessage->len, rkmessage->offset,
+			rkmessage->partition,
+			(int)rkmessage->len, (const char *)rkmessage->payload);
 }
 
 
@@ -153,12 +159,34 @@ static void msg_consume (rd_kafka_message_t *rkmessage,
 		       rkmessage->partition,
 		       rkmessage->offset,
 		       rd_kafka_message_errstr(rkmessage));
+
+                if (rkmessage->err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION ||
+                    rkmessage->err == RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC)
+                        run = 0;
 		return;
 	}
 
-	if (!quiet)
+	if (!quiet) {
+		rd_kafka_timestamp_type_t tstype;
+		int64_t timestamp;
 		fprintf(stdout, "%% Message (offset %"PRId64", %zd bytes):\n",
 			rkmessage->offset, rkmessage->len);
+
+		timestamp = rd_kafka_message_timestamp(rkmessage, &tstype);
+		if (tstype != RD_KAFKA_TIMESTAMP_NOT_AVAILABLE) {
+			const char *tsname = "?";
+			if (tstype == RD_KAFKA_TIMESTAMP_CREATE_TIME)
+				tsname = "create time";
+			else if (tstype == RD_KAFKA_TIMESTAMP_LOG_APPEND_TIME)
+				tsname = "log append time";
+
+			fprintf(stdout, "%% Message timestamp: %s %"PRId64
+				" (%ds ago)\n",
+				tsname, timestamp,
+				!timestamp ? 0 :
+				(int)time(NULL) - (int)(timestamp/1000));
+		}
+	}
 
 	if (rkmessage->key_len) {
 		if (output == OUTPUT_HEXDUMP)
@@ -251,16 +279,19 @@ int main (int argc, char **argv) {
 	rd_kafka_conf_t *conf;
 	rd_kafka_topic_conf_t *topic_conf;
 	char errstr[512];
-	const char *debug = NULL;
 	int64_t start_offset = 0;
         int report_offsets = 0;
 	int do_conf_dump = 0;
 	char tmp[16];
-
-	quiet = !isatty(STDIN_FILENO);
+        int64_t seek_offset = 0;
+        int64_t tmp_offset = 0;
+	int get_wmarks = 0;
 
 	/* Kafka configuration */
 	conf = rd_kafka_conf_new();
+
+        /* Set logger */
+        rd_kafka_conf_set_log_cb(conf, logger);
 
 	/* Quick termination */
 	snprintf(tmp, sizeof(tmp), "%i", SIGIO);
@@ -269,7 +300,7 @@ int main (int argc, char **argv) {
 	/* Topic configuration */
 	topic_conf = rd_kafka_topic_conf_new();
 
-	while ((opt = getopt(argc, argv, "PCLt:p:b:z:qd:o:eX:A")) != -1) {
+	while ((opt = getopt(argc, argv, "PCLt:p:b:z:qd:o:eX:As:")) != -1) {
 		switch (opt) {
 		case 'P':
 		case 'C':
@@ -295,26 +326,42 @@ int main (int argc, char **argv) {
 			}
 			break;
 		case 'o':
+                case 's':
 			if (!strcmp(optarg, "end"))
-				start_offset = RD_KAFKA_OFFSET_END;
+				tmp_offset = RD_KAFKA_OFFSET_END;
 			else if (!strcmp(optarg, "beginning"))
-				start_offset = RD_KAFKA_OFFSET_BEGINNING;
+				tmp_offset = RD_KAFKA_OFFSET_BEGINNING;
 			else if (!strcmp(optarg, "stored"))
-				start_offset = RD_KAFKA_OFFSET_STORED;
+				tmp_offset = RD_KAFKA_OFFSET_STORED;
                         else if (!strcmp(optarg, "report"))
                                 report_offsets = 1;
+			else if (!strcmp(optarg, "wmark"))
+				get_wmarks = 1;
 			else {
-				start_offset = strtoll(optarg, NULL, 10);
+				tmp_offset = strtoll(optarg, NULL, 10);
 
-				if (start_offset < 0)
-					start_offset = RD_KAFKA_OFFSET_TAIL(-start_offset);
+				if (tmp_offset < 0)
+					tmp_offset = RD_KAFKA_OFFSET_TAIL(-tmp_offset);
 			}
+
+                        if (opt == 'o')
+                                start_offset = tmp_offset;
+                        else if (opt == 's')
+                                seek_offset = tmp_offset;
 			break;
 		case 'e':
 			exit_eof = 1;
 			break;
 		case 'd':
-			debug = optarg;
+			if (rd_kafka_conf_set(conf, "debug", optarg,
+					      errstr, sizeof(errstr)) !=
+			    RD_KAFKA_CONF_OK) {
+				fprintf(stderr,
+					"%% Debug configuration failed: "
+					"%s: %s\n",
+					errstr, optarg);
+				exit(1);
+			}
 			break;
 		case 'q':
 			quiet = 1;
@@ -340,9 +387,30 @@ int main (int argc, char **argv) {
 
 			name = optarg;
 			if (!(val = strchr(name, '='))) {
-				fprintf(stderr, "%% Expected "
-					"-X property=value, not %s\n", name);
-				exit(1);
+				char dest[512];
+				size_t dest_size = sizeof(dest);
+				/* Return current value for property. */
+
+				res = RD_KAFKA_CONF_UNKNOWN;
+				if (!strncmp(name, "topic.", strlen("topic.")))
+					res = rd_kafka_topic_conf_get(
+						topic_conf,
+						name+strlen("topic."),
+						dest, &dest_size);
+				if (res == RD_KAFKA_CONF_UNKNOWN)
+					res = rd_kafka_conf_get(
+						conf, name, dest, &dest_size);
+
+				if (res == RD_KAFKA_CONF_OK) {
+					printf("%s = %s\n", name, dest);
+					exit(0);
+				} else {
+					fprintf(stderr,
+						"%% %s property\n",
+						res == RD_KAFKA_CONF_UNKNOWN ?
+						"Unknown" : "Invalid");
+					exit(1);
+				}
 			}
 
 			*val = '\0';
@@ -394,7 +462,7 @@ int main (int argc, char **argv) {
 							       &cnt);
 			}
 
-			for (i = 0 ; i < cnt ; i += 2)
+			for (i = 0 ; i < (int)cnt ; i += 2)
 				printf("%s = %s\n",
 				       arr[i], arr[i+1]);
 
@@ -425,19 +493,22 @@ int main (int argc, char **argv) {
 			"                  none|gzip|snappy\n"
 			"  -o <offset>     Start offset (consumer):\n"
 			"                  beginning, end, NNNNN or -NNNNN\n"
+			"                  wmark returns the current hi&lo "
+			"watermarks.\n"
                         "  -o report       Report message offsets (producer)\n"
 			"  -e              Exit consumer when last message\n"
 			"                  in partition has been received.\n"
 			"  -d [facs..]     Enable debugging contexts:\n"
+			"                  %s\n"
 			"  -q              Be quiet\n"
 			"  -A              Raw payload output (consumer)\n"
-			"                  %s\n"
-			"  -X <prop=name> Set arbitrary librdkafka "
+			"  -X <prop=name>  Set arbitrary librdkafka "
 			"configuration property\n"
-			"               Properties prefixed with \"topic.\" "
+			"                  Properties prefixed with \"topic.\" "
 			"will be set on topic object.\n"
-			"               Use '-X list' to see the full list\n"
-			"               of supported properties.\n"
+			"  -X list         Show full list of supported "
+			"properties.\n"
+			"  -X <prop>       Get single property value\n"
 			"\n"
 			" In Consumer mode:\n"
 			"  writes fetched messages to stdout\n"
@@ -455,17 +526,13 @@ int main (int argc, char **argv) {
 		exit(1);
 	}
 
+	if ((mode == 'C' && !isatty(STDIN_FILENO)) ||
+	    (mode != 'C' && !isatty(STDOUT_FILENO)))
+		quiet = 1;
+
 
 	signal(SIGINT, stop);
 	signal(SIGUSR1, sig_usr1);
-
-	if (debug &&
-	    rd_kafka_conf_set(conf, "debug", debug, errstr, sizeof(errstr)) !=
-	    RD_KAFKA_CONF_OK) {
-		fprintf(stderr, "%% Debug configuration failed: %s: %s\n",
-			errstr, debug);
-		exit(1);
-	}
 
 	if (mode == 'P') {
 		/*
@@ -497,8 +564,6 @@ int main (int argc, char **argv) {
 			exit(1);
 		}
 
-		/* Set logger */
-		rd_kafka_set_logger(rk, logger);
 		rd_kafka_set_log_level(rk, LOG_DEBUG);
 
 		/* Add brokers */
@@ -509,6 +574,7 @@ int main (int argc, char **argv) {
 
 		/* Create topic */
 		rkt = rd_kafka_topic_new(rk, topic, topic_conf);
+                topic_conf = NULL; /* Now owned by topic */
 
 		if (!quiet)
 			fprintf(stderr,
@@ -534,8 +600,7 @@ int main (int argc, char **argv) {
 					"%% Failed to produce to topic %s "
 					"partition %i: %s\n",
 					rd_kafka_topic_name(rkt), partition,
-					rd_kafka_err2str(
-						rd_kafka_errno2err(errno)));
+					rd_kafka_err2str(rd_kafka_last_error()));
 				/* Poll to handle delivery reports */
 				rd_kafka_poll(rk, 0);
 				continue;
@@ -577,8 +642,6 @@ int main (int argc, char **argv) {
 			exit(1);
 		}
 
-		/* Set logger */
-		rd_kafka_set_logger(rk, logger);
 		rd_kafka_set_log_level(rk, LOG_DEBUG);
 
 		/* Add brokers */
@@ -587,18 +650,52 @@ int main (int argc, char **argv) {
 			exit(1);
 		}
 
+		if (get_wmarks) {
+			int64_t lo, hi;
+                        rd_kafka_resp_err_t err;
+
+			/* Only query for hi&lo partition watermarks */
+
+			if ((err = rd_kafka_query_watermark_offsets(
+				     rk, topic, partition, &lo, &hi, 5000))) {
+				fprintf(stderr, "%% query_watermark_offsets() "
+					"failed: %s\n",
+					rd_kafka_err2str(err));
+				exit(1);
+			}
+
+			printf("%s [%d]: low - high offsets: "
+			       "%"PRId64" - %"PRId64"\n",
+			       topic, partition, lo, hi);
+
+			rd_kafka_destroy(rk);
+			exit(0);
+		}
+
+
 		/* Create topic */
 		rkt = rd_kafka_topic_new(rk, topic, topic_conf);
+                topic_conf = NULL; /* Now owned by topic */
 
 		/* Start consuming */
 		if (rd_kafka_consume_start(rkt, partition, start_offset) == -1){
+			rd_kafka_resp_err_t err = rd_kafka_last_error();
 			fprintf(stderr, "%% Failed to start consuming: %s\n",
-				rd_kafka_err2str(rd_kafka_errno2err(errno)));
+				rd_kafka_err2str(err));
+                        if (err == RD_KAFKA_RESP_ERR__INVALID_ARG)
+                                fprintf(stderr,
+                                        "%% Broker based offset storage "
+                                        "requires a group.id, "
+                                        "add: -X group.id=yourGroup\n");
 			exit(1);
 		}
 
 		while (run) {
 			rd_kafka_message_t *rkmessage;
+                        rd_kafka_resp_err_t err;
+
+                        /* Poll for errors, etc. */
+                        rd_kafka_poll(rk, 0);
 
 			/* Consume single message.
 			 * See rdkafka_performance.c for high speed
@@ -611,10 +708,25 @@ int main (int argc, char **argv) {
 
 			/* Return message to rdkafka */
 			rd_kafka_message_destroy(rkmessage);
+
+                        if (seek_offset) {
+                                err = rd_kafka_seek(rkt, partition, seek_offset,
+                                                    2000);
+                                if (err)
+                                        printf("Seek failed: %s\n",
+                                               rd_kafka_err2str(err));
+                                else
+                                        printf("Seeked to %"PRId64"\n",
+                                               seek_offset);
+                                seek_offset = 0;
+                        }
 		}
 
 		/* Stop consuming */
 		rd_kafka_consume_stop(rkt, partition);
+
+                while (rd_kafka_outq_len(rk) > 0)
+                        rd_kafka_poll(rk, 10);
 
 		/* Destroy topic */
 		rd_kafka_topic_destroy(rkt);
@@ -634,8 +746,6 @@ int main (int argc, char **argv) {
 			exit(1);
 		}
 
-		/* Set logger */
-		rd_kafka_set_logger(rk, logger);
 		rd_kafka_set_log_level(rk, LOG_DEBUG);
 
 		/* Add brokers */
@@ -645,9 +755,10 @@ int main (int argc, char **argv) {
 		}
 
                 /* Create topic */
-                if (topic)
+                if (topic) {
                         rkt = rd_kafka_topic_new(rk, topic, topic_conf);
-                else
+                        topic_conf = NULL; /* Now owned by topic */
+                } else
                         rkt = NULL;
 
                 while (run) {
@@ -677,13 +788,24 @@ int main (int argc, char **argv) {
 		/* Destroy the handle */
 		rd_kafka_destroy(rk);
 
+                if (topic_conf)
+                        rd_kafka_topic_conf_destroy(topic_conf);
+
+
                 /* Exit right away, dont wait for background cleanup, we haven't
                  * done anything important anyway. */
                 exit(err ? 2 : 0);
         }
 
+        if (topic_conf)
+                rd_kafka_topic_conf_destroy(topic_conf);
+
 	/* Let background threads clean up and terminate cleanly. */
-	rd_kafka_wait_destroyed(2000);
+	run = 5;
+	while (run-- > 0 && rd_kafka_wait_destroyed(1000) == -1)
+		printf("Waiting for librdkafka to decommission\n");
+	if (run <= 0)
+		rd_kafka_dump(stdout, rk);
 
 	return 0;
 }

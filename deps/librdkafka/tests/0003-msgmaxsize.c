@@ -31,10 +31,6 @@
  * Issue #24
  */
 
-#define _GNU_SOURCE
-#include <sys/time.h>
-#include <time.h>
-
 #include "test.h"
 
 /* Typical include path would be <librdkafka/rdkafka.h>, but this program
@@ -69,7 +65,7 @@ static void dr_cb (rd_kafka_t *rk, void *payload, size_t len,
 }
 
 
-int main (int argc, char **argv) {
+int main_0003_msgmaxsize (int argc, char **argv) {
 	int partition = 0;
 	int r;
 	rd_kafka_t *rk;
@@ -77,7 +73,8 @@ int main (int argc, char **argv) {
 	rd_kafka_conf_t *conf;
 	rd_kafka_topic_conf_t *topic_conf;
 	char errstr[512];
-	char msg[100000];
+	char *msg;
+	static const int msgsize = 100000;
 	int msgcnt = 10;
 	int i;
 
@@ -99,13 +96,13 @@ int main (int argc, char **argv) {
 
 	TEST_SAY("Created    kafka instance %s\n", rd_kafka_name(rk));
 
-	rkt = rd_kafka_topic_new(rk, test_mk_topic_name("generic", 0),
+	rkt = rd_kafka_topic_new(rk, test_mk_topic_name("0003", 0),
                                  topic_conf);
 	if (!rkt)
 		TEST_FAIL("Failed to create topic: %s\n",
-			  strerror(errno));
+			  rd_strerror(errno));
 
-	memset(msg, 0, sizeof(msg));
+	msg = calloc(1, msgsize);
 
 	/* Produce 'msgcnt' messages, size odd ones larger than max.bytes,
 	 * and even ones smaller than max.bytes. */
@@ -124,7 +121,7 @@ int main (int argc, char **argv) {
 			msgs_wait |= (1 << i);
 		}
 
-		snprintf(msg, sizeof(msg), "%s test message #%i", argv[0], i);
+		rd_snprintf(msg, msgsize, "%s test message #%i", argv[0], i);
 		r = rd_kafka_produce(rkt, partition, RD_KAFKA_MSG_F_COPY,
 				     msg, len, NULL, 0, msgidp);
 
@@ -135,7 +132,7 @@ int main (int argc, char **argv) {
 			free(msgidp);
 		} else if (r == -1)
 			TEST_FAIL("Failed to produce message #%i: %s\n",
-				  i, strerror(errno));
+				  i, rd_strerror(errno));
 	}
 
 	/* Wait for messages to be delivered. */
@@ -145,6 +142,8 @@ int main (int argc, char **argv) {
 	if (msgs_wait != 0)
 		TEST_FAIL("Still waiting for messages: 0x%x\n", msgs_wait);
 
+	free(msg);
+
 	/* Destroy topic */
 	rd_kafka_topic_destroy(rkt);
 		
@@ -152,11 +151,5 @@ int main (int argc, char **argv) {
 	TEST_SAY("Destroying kafka instance %s\n", rd_kafka_name(rk));
 	rd_kafka_destroy(rk);
 
-	/* Wait for everything to be cleaned up since broker destroys are
-	 * handled in its own thread. */
-	test_wait_exit(10);
-
-	/* If we havent failed at this point then
-	 * there were no threads leaked */
 	return 0;
 }
